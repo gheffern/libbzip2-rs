@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use core::ffi::c_int;
 
 use crate::allocator::Allocator;
@@ -1302,6 +1300,71 @@ pub(crate) fn decompress(
     ret_val
 }
 
+#[allow(dead_code)]
+#[rustfmt::skip]
+static MTF_SHUFFLE_MASKS: [[u8; 16]; 16] = [
+    [ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15], // nn = 0
+    [ 1,  0,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15], // nn = 1
+    [ 2,  0,  1,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15], // nn = 2
+    [ 3,  0,  1,  2,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15], // nn = 3
+    [ 4,  0,  1,  2,  3,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15], // nn = 4
+    [ 5,  0,  1,  2,  3,  4,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15], // nn = 5
+    [ 6,  0,  1,  2,  3,  4,  5,  7,  8,  9, 10, 11, 12, 13, 14, 15], // nn = 6
+    [ 7,  0,  1,  2,  3,  4,  5,  6,  8,  9, 10, 11, 12, 13, 14, 15], // nn = 7
+    [ 8,  0,  1,  2,  3,  4,  5,  6,  7,  9, 10, 11, 12, 13, 14, 15], // nn = 8
+    [ 9,  0,  1,  2,  3,  4,  5,  6,  7,  8, 10, 11, 12, 13, 14, 15], // nn = 9
+    [10,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 11, 12, 13, 14, 15], // nn = 10
+    [11,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 12, 13, 14, 15], // nn = 11
+    [12,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 13, 14, 15], // nn = 12
+    [13,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 14, 15], // nn = 13
+    [14,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 15], // nn = 14
+    [15,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14], // nn = 15
+];
+
+#[allow(dead_code)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn mtf_shuffle_16_ssse3(ptr: *mut u8, nn: usize) {
+    use core::arch::x86_64::*;
+    // SAFETY: caller guarantees ptr points to at least 16 readable/writable bytes,
+    // and nn < 16 index into MTF_SHUFFLE_MASKS.
+    unsafe {
+        let cur = _mm_loadu_si128(ptr as *const __m128i);
+        let mask = _mm_loadu_si128(MTF_SHUFFLE_MASKS.as_ptr().add(nn) as *const __m128i);
+        let updated = _mm_shuffle_epi8(cur, mask);
+        _mm_storeu_si128(ptr as *mut __m128i, updated);
+    }
+}
+
+#[allow(dead_code)]
+#[cfg(target_arch = "aarch64")]
+unsafe fn mtf_shuffle_16_neon(ptr: *mut u8, nn: usize) {
+    use core::arch::aarch64::*;
+    // SAFETY: caller guarantees ptr points to at least 16 readable/writable bytes,
+    // and nn < 16 index into MTF_SHUFFLE_MASKS.
+    unsafe {
+        let cur = vld1q_u8(ptr);
+        let mask = vld1q_u8(MTF_SHUFFLE_MASKS[nn].as_ptr());
+        let updated = vqtbl1q_u8(cur, mask);
+        vst1q_u8(ptr, updated);
+    }
+}
+
+#[allow(dead_code)]
+#[cfg(target_arch = "wasm32")]
+#[target_feature(enable = "simd128")]
+unsafe fn mtf_shuffle_16_wasm(ptr: *mut u8, nn: usize) {
+    use core::arch::wasm32::*;
+    // SAFETY: caller guarantees ptr points to at least 16 readable/writable bytes,
+    // and nn < 16 index into MTF_SHUFFLE_MASKS.
+    unsafe {
+        let cur = v128_load(ptr as *const v128);
+        let mask = v128_load(MTF_SHUFFLE_MASKS.as_ptr().add(nn) as *const v128);
+        let updated = i8x16_swizzle(cur, mask);
+        v128_store(ptr as *mut v128, updated);
+    }
+}
+
 fn initialize_mtfa(mtfa: &mut [u8; 4096], mtfbase: &mut [u16; 16], nextSym: u16) -> u8 {
     let nn = usize::from(nextSym - 1);
 
@@ -1309,6 +1372,28 @@ fn initialize_mtfa(mtfa: &mut [u8; 4096], mtfbase: &mut [u16; 16], nextSym: u16)
         // avoid general case expense
         let pp = usize::from(mtfbase[0]);
         let uc = mtfa[pp + nn];
+
+        #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+        if pp + 16 <= 4096 {
+            // SAFETY: pp + 16 <= 4096 ensures 16-byte load/store is strictly within mtfa.
+            unsafe { mtf_shuffle_16_ssse3(mtfa.as_mut_ptr().add(pp), nn) };
+            return uc;
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if pp + 16 <= 4096 {
+            // SAFETY: pp + 16 <= 4096 ensures 16-byte load/store is strictly within mtfa.
+            unsafe { mtf_shuffle_16_neon(mtfa.as_mut_ptr().add(pp), nn) };
+            return uc;
+        }
+
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        if pp + 16 <= 4096 {
+            // SAFETY: pp + 16 <= 4096 ensures 16-byte load/store is strictly within mtfa.
+            unsafe { mtf_shuffle_16_wasm(mtfa.as_mut_ptr().add(pp), nn) };
+            return uc;
+        }
+
         rotate_right_1(&mut mtfa[pp..][..=nn]);
 
         uc
@@ -1347,20 +1432,111 @@ fn initialize_mtfa(mtfa: &mut [u8; 4096], mtfbase: &mut [u16; 16], nextSym: u16)
 }
 
 fn rotate_right_1(slice: &mut [u8]) {
-    match slice {
-        [] | [_] => { /* ignore */ }
-        [a, b] => {
-            // The 2-element case is fairly common, and because we already branch on the length,
-            // the check for `len == 2` is very cheap.
-            //
-            // On x86_64 the `rol` instruction is used to swap the bytes with just 1 instruction.
-            // See https://godbolt.org/z/385K7qs91
-            core::mem::swap(a, b)
-        }
-        [.., last] => {
-            let last = *last;
-            slice.copy_within(0..slice.len() - 1, 1);
+    match slice.len() {
+        0 | 1 => (),
+        2 => slice.swap(0, 1),
+        3 => {
+            let last = slice[2];
+            slice[2] = slice[1];
+            slice[1] = slice[0];
             slice[0] = last;
+        }
+        4 => {
+            let last = slice[3];
+            slice[3] = slice[2];
+            slice[2] = slice[1];
+            slice[1] = slice[0];
+            slice[0] = last;
+        }
+        n => {
+            let last = slice[n - 1];
+            slice.copy_within(..n - 1, 1);
+            slice[0] = last;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mtf_shuffle_parity() {
+        for nn in 0..16 {
+            let mut expected: [u8; 16] = [
+                10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+            ];
+            let mut actual = expected;
+
+            rotate_right_1(&mut expected[..=nn]);
+
+            #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+            unsafe {
+                mtf_shuffle_16_ssse3(actual.as_mut_ptr(), nn);
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                mtf_shuffle_16_neon(actual.as_mut_ptr(), nn);
+            }
+
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            unsafe {
+                mtf_shuffle_16_wasm(actual.as_mut_ptr(), nn);
+            }
+
+            #[cfg(all(
+                not(all(target_arch = "x86_64", target_feature = "ssse3")),
+                not(target_arch = "aarch64"),
+                not(all(target_arch = "wasm32", target_feature = "simd128"))
+            ))]
+            rotate_right_1(&mut actual[..=nn]);
+
+            assert_eq!(
+                expected, actual,
+                "SIMD MTF permutation mismatch for nn = {}",
+                nn
+            );
+        }
+    }
+
+    #[test]
+    fn test_initialize_mtfa_coverage() {
+        let mut mtfa = [0u8; 4096];
+        for (i, elem) in mtfa.iter_mut().enumerate().take(256) {
+            *elem = i as u8;
+        }
+        let mut mtfbase = [0u16; 16];
+        for (i, elem) in mtfbase.iter_mut().enumerate() {
+            *elem = (i * 16) as u16;
+        }
+
+        // Test exact SIMD fast-path boundary where pp = 4080 (4080 + 16 == 4096)
+        mtfbase[0] = 4080;
+        mtfa[4080..4096].copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        let uc = initialize_mtfa(&mut mtfa, &mut mtfbase, 4);
+        assert_eq!(uc, 3);
+        assert_eq!(mtfa[4080], 3);
+
+        // Test exact fallback boundary where pp = 4081 (4081 + 16 == 4097 > 4096)
+        mtfbase[0] = 4081;
+        mtfa[4081..4096].copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+        let uc = initialize_mtfa(&mut mtfa, &mut mtfbase, 3);
+        assert_eq!(uc, 2);
+        assert_eq!(mtfa[4081], 2);
+
+        // Test fallback where pp + 16 > 4096
+        mtfbase[0] = 4090;
+        let uc = initialize_mtfa(&mut mtfa, &mut mtfbase, 3);
+        assert_eq!(uc, mtfa[4090]);
+
+        // Test all symbol ranges 1..=256
+        let mut mtfbase_full = [0u16; 16];
+        for (i, elem) in mtfbase_full.iter_mut().enumerate() {
+            *elem = ((i + 1) * 16) as u16;
+        }
+        for sym in 1..=256 {
+            initialize_mtfa(&mut mtfa, &mut mtfbase_full, sym);
         }
     }
 }
